@@ -6,16 +6,12 @@ B. 月统计Excel（6列，含斜线样式）
 """
 import os
 import pandas as pd
-from openpyxl import load_workbook, Workbook
+from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Border, Side, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from src.modules.word_parser import parse_weekly_schedule, count_actual_shifts
 from src.utils.helpers import pinyin_key
-
-
-DEFAULT_SHIFTS_PER_WEEK = 2  # 助理默认应值班次
-MAX_REDUCE = 2               # 单日至多核减数
 
 
 # ============================================================
@@ -25,9 +21,10 @@ def generate_weekly_excel(
     word_path: str,
     total_names: list,
     holidays: list,
-    overtime_shifts: dict | None,
     output_path: str,
     actual_word_path: str | None = None,
+    senior_assistants: list | None = None,
+    senior_should_fixed_enabled: bool = False,
 ) -> str:
     """
     生成周统计Excel。
@@ -35,10 +32,11 @@ def generate_weekly_excel(
         word_path: 排班名单Word文件路径（用于应值班次计算）
         total_names: 总名单（来自 data_manager）
         holidays: 放假的星期列表，如 ["周三", "周五"]
-        overtime_shifts: 加班班次字典，如 {"张三": 1, "李四": 2}
         output_path: 输出文件完整路径（.xlsx）
         actual_word_path: 实际周统计人员名单Word路径（用于实际班次计算）；
                  为空时回退使用 word_path（兼容旧流程）
+        senior_assistants: 被标记为大四助理的姓名列表
+        senior_should_fixed_enabled: 开启后，大四助理应值班次强制为 1
     返回:
         实际写入的文件路径
     """
@@ -50,19 +48,9 @@ def generate_weekly_excel(
     weekly_schedule_for_actual = parse_weekly_schedule(actual_source_path, total_names)
     actual = count_actual_shifts(weekly_schedule_for_actual, total_names)
 
-    # 2.1 加班补录：最终实际班次 = 文档统计 + 加班班次
-    for person, extra in (overtime_shifts or {}).items():
-        if person not in actual:
-            continue
-        try:
-            extra_n = int(extra)
-        except (ValueError, TypeError):
-            continue
-        if extra_n > 0:
-            actual[person] += extra_n
-
-    # 3. 应值班次（含放假核减）
-    should = {n: DEFAULT_SHIFTS_PER_WEEK for n in total_names}
+    # 3) 应值班次：优先按排班名单统计，再按放假日期核减
+    should = count_actual_shifts(weekly_schedule_for_should, total_names)
+    holiday_reduction_counter = {n: 0 for n in total_names}
     for holiday in holidays or []:
         if holiday not in weekly_schedule_for_should:
             continue
@@ -73,10 +61,19 @@ def generate_weekly_excel(
             per_person[n] = per_person.get(n, 0) + 1
         # 核减
         for person, times in per_person.items():
-            reduce_n = min(times, MAX_REDUCE)
-            should[person] = max(0, should[person] - reduce_n)
+            if person in holiday_reduction_counter:
+                holiday_reduction_counter[person] += times
+            should[person] = max(0, should[person] - times)
 
-    # 4. 构建DataFrame
+    # 4) 可选规则：大四助理应值班次固定为 1
+    if senior_should_fixed_enabled and senior_assistants:
+        senior_set = set(senior_assistants)
+        for name in total_names:
+            if name in senior_set:
+                # 放假优先级更高：先固定为1，再按放假核减
+                should[name] = max(0, 1 - holiday_reduction_counter.get(name, 0))
+
+    # 5. 构建DataFrame
     rows = []
     for name in total_names:
         s = should[name]
@@ -91,10 +88,10 @@ def generate_weekly_excel(
         })
     df = pd.DataFrame(rows, columns=["姓名", "应值班次", "实际班次", "缺班", "备注"])
 
-    # 5. 按缺班倒序
+    # 6. 按缺班倒序
     df = df.sort_values(by="缺班", ascending=False, kind="mergesort").reset_index(drop=True)
 
-    # 6. 写入Excel（带样式）
+    # 7. 写入Excel（带样式）
     _safe_write_excel(df, output_path, sheet_name="周统计", apply_weekly_style=True)
     return output_path
 

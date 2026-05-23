@@ -14,7 +14,8 @@ NAME_REGEX = re.compile(r"[\u4e00-\u9fa5]{2,4}")
 
 # 月度Word表头列名（反向解析时用于匹配列索引）
 MONTHLY_HEADER_REQUIRED = ("姓名", "多值班次", "缺班数量")
-# 识别星期标题：周一、星期一、周1 等
+# 识别星期标题：周一、星期一、周1 等。
+# 约定：星期标题必须在 Word 中单独成行，避免姓名中包含“周一”等词时被误判。
 WEEKDAY_PATTERNS = {
     "周一": ["周一", "星期一", "礼拜一", "周1"],
     "周二": ["周二", "星期二", "礼拜二", "周2"],
@@ -24,6 +25,41 @@ WEEKDAY_PATTERNS = {
     "周六": ["周六", "星期六", "礼拜六", "周6"],
     "周日": ["周日", "星期日", "星期天", "礼拜日", "礼拜天", "周7"],
 }
+
+
+def _normalize_name_line(line: str) -> str:
+    """
+    规范化姓名行文本：
+    - 仅移除中文字符之间的全角空格（\u3000），修复“张　爽”这类被拆分问题；
+    - 不移除普通空格，避免把“张三 李四”错误拼接成“张三李四”。
+    """
+    if not line:
+        return ""
+    return re.sub(r"(?<=[\u4e00-\u9fa5])\u3000(?=[\u4e00-\u9fa5])", "", line)
+
+
+def _extract_names_from_line(line: str) -> list:
+    """从单行文本中提取姓名（2-4 个汉字），兼容姓名内全角空格。"""
+    normalized = _normalize_name_line(line)
+    names = []
+    for token in re.split(r"\s+", normalized.strip()):
+        if not token:
+            continue
+        names.extend(NAME_REGEX.findall(token))
+    return names
+
+
+def _strip_weekday_marker(line: str, weekday_key: str) -> str:
+    """
+    去掉单独成行的周标题别名，避免“周几/星期几”等被误识别为姓名。
+    """
+    if not line:
+        return ""
+    aliases = WEEKDAY_PATTERNS.get(weekday_key, [])
+    cleaned = line
+    for alias in aliases:
+        cleaned = cleaned.replace(alias, " ")
+    return cleaned
 
 
 def _iter_all_text(doc: Document):
@@ -54,21 +90,19 @@ def parse_total_name_list(docx_path: str) -> list:
     names = []
     seen = set()
     for line in lines:
-        # 先按空白分割，再用正则提取中文姓名（防止混入课节等字符）
-        for token in re.split(r"\s+", line):
-            for name in NAME_REGEX.findall(token):
-                if name not in seen:
-                    seen.add(name)
-                    names.append(name)
+        for name in _extract_names_from_line(line):
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
     return names
 
 
 def _match_weekday(text: str) -> str:
-    """判断一段文本是否是某一天的标题行；返回 周一~周日 或 None"""
+    """判断一段文本是否是某一天的标题行；星期标题必须单独成行。"""
+    normalized = (text or "").strip()
     for key, aliases in WEEKDAY_PATTERNS.items():
-        for alias in aliases:
-            if alias in text:
-                return key
+        if normalized in aliases:
+            return key
     return None
 
 
@@ -81,7 +115,7 @@ def parse_weekly_schedule(docx_path: str, total_names: list) -> dict:
         ...
     }
     说明：
-        - 按出现顺序遇到周X标题，其后（直到下一个周X标题）的人名都归入该天；
+        - 按出现顺序遇到单独成行的周X标题，其后（直到下一个周X标题）的人名都归入该天；
         - 若文档通过表格呈现，会将所有单元格文本按顺序纳入；
         - 只保留出现在总名单中的姓名，自动过滤"1-2节"等课节干扰。
     """
@@ -96,12 +130,16 @@ def parse_weekly_schedule(docx_path: str, total_names: list) -> dict:
         weekday = _match_weekday(line)
         if weekday is not None:
             current_day = weekday
-            # 标题行也可能同时包含姓名，继续解析该行剩余内容
+            # 星期标题必须单独成行；标题行本身通常不包含姓名。
         if current_day is None:
             continue
 
+        parse_line = line
+        if weekday is not None:
+            parse_line = _strip_weekday_marker(line, weekday)
+
         # 提取中文姓名并按总名单过滤
-        for name in NAME_REGEX.findall(line):
+        for name in _extract_names_from_line(parse_line):
             if name in name_set:
                 result[current_day].append(name)
 
