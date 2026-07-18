@@ -56,6 +56,12 @@ DATA_ROW_HEIGHT = "561"
 TITLE_FONT_SIZE = "48"
 BODY_FONT_SIZE = "24"
 FONT_NAME = "宋体"
+MONTHLY_WEEKLY_FILE_MIN_COUNT = 1
+MONTHLY_WEEKLY_FILE_MAX_COUNT = 4
+# 生成前合理性校验（软警告）：满 4 周时，非毕业季助理的周应值合计应落在 [4, 8]。
+MONTHLY_FULL_WEEK_COUNT = 4
+MONTHLY_SHOULD_MIN = 4
+MONTHLY_SHOULD_MAX = 8
 
 
 # ============================================================
@@ -68,12 +74,13 @@ def generate_monthly_word(
     output_path: str,
     title_text: str | None = None,
     overtime_shifts: dict | None = None,
+    penalty_shifts: dict | None = None,
 ) -> str:
     """
     生成月度 Word 报表。
 
     参数:
-        weekly_excel_paths: 本月周统计 Excel 路径列表，至少 1 份
+        weekly_excel_paths: 本月周统计 Excel 路径列表，必须为 1 到 4 份
         total_names: 当前总名单（来自 DataManager）
         prev_word_path: 上月月度 Word 路径；None 或 "" 表示首次运行
         output_path: 输出 .docx 路径
@@ -83,8 +90,31 @@ def generate_monthly_word(
     返回:
         实际写入的文件路径
     """
+    rows = build_monthly_rows(
+        weekly_excel_paths=weekly_excel_paths,
+        total_names=total_names,
+        prev_word_path=prev_word_path,
+        overtime_shifts=overtime_shifts,
+        penalty_shifts=penalty_shifts,
+    )
+    return generate_monthly_word_from_rows(rows, output_path, title_text=title_text)
+
+
+def build_monthly_rows(
+    weekly_excel_paths: list,
+    total_names: list,
+    prev_word_path: str | None,
+    overtime_shifts: dict | None = None,
+    penalty_shifts: dict | None = None,
+) -> list[dict]:
+    """计算月统计数据行，供预览和 Word 生成共用。"""
     if not total_names:
         raise ValueError("总名单为空，请先在基础设置中导入。")
+    weekly_count = len(weekly_excel_paths or [])
+    if weekly_count < MONTHLY_WEEKLY_FILE_MIN_COUNT:
+        raise ValueError("月统计至少选择 1 份周统计Excel。")
+    if weekly_count > MONTHLY_WEEKLY_FILE_MAX_COUNT:
+        raise ValueError("月统计最多选择 4 份周统计Excel。")
 
     cur_actual, cur_should = aggregate_weekly_files(weekly_excel_paths, total_names)
 
@@ -102,9 +132,15 @@ def generate_monthly_word(
             extra = 0
         if extra < 0:
             extra = 0
+        try:
+            penalty = int((penalty_shifts or {}).get(name, 0))
+        except (ValueError, TypeError):
+            penalty = 0
+        if penalty < 0:
+            penalty = 0
 
         total_cnt = cur_actual.get(name, 0) + prev_over + extra
-        should_cnt = cur_should.get(name, 0) + prev_absence
+        should_cnt = cur_should.get(name, 0) + prev_absence + penalty
         over = total_cnt - should_cnt
         absence = should_cnt - total_cnt
         rows.append({
@@ -115,8 +151,79 @@ def generate_monthly_word(
             "缺班数量": absence,
         })
 
-    rows.sort(key=lambda r: (-r["多值班次"], r["缺班数量"], pinyin_key(r["姓名"])))
+    return sort_monthly_rows(rows)
 
+
+def collect_monthly_warnings(
+    weekly_excel_paths: list,
+    total_names: list,
+    senior_assistants: list | None = None,
+) -> dict:
+    """
+    月统计生成前的软警告（不阻断生成），均排除毕业季助理。
+
+    返回:
+        {
+            "messages": [str, ...],        # 人类可读的提醒
+            "highlight_names": set[str],   # 需要在预览里高亮的姓名
+        }
+
+    校验:
+        M1 应值范围：仅当选满 4 份周 Excel 时，非毕业季助理的周应值合计
+                     （不含罚班、上月结转）落在 [4, 8] 之外即提醒。
+        M2 本月全零：非毕业季助理在所选周里应值与实际均为 0 即提醒。
+    """
+    cur_actual, cur_should = aggregate_weekly_files(weekly_excel_paths, total_names)
+    senior_set = set(senior_assistants or [])
+    weekly_count = len(weekly_excel_paths or [])
+
+    messages = []
+    highlight_names = set()
+
+    out_of_range = []
+    all_zero = []
+    for name in total_names:
+        if name in senior_set:
+            continue
+        should = cur_should.get(name, 0)
+        actual = cur_actual.get(name, 0)
+        if weekly_count == MONTHLY_FULL_WEEK_COUNT and (
+            should > MONTHLY_SHOULD_MAX or should < MONTHLY_SHOULD_MIN
+        ):
+            out_of_range.append(name)
+            highlight_names.add(name)
+        if should == 0 and actual == 0:
+            all_zero.append(name)
+            highlight_names.add(name)
+
+    if out_of_range:
+        names_text = "、".join(out_of_range)
+        messages.append(
+            f"以下非毕业季助理本月周应值合计不在 {MONTHLY_SHOULD_MIN}-{MONTHLY_SHOULD_MAX} 之间：{names_text}"
+        )
+    if all_zero:
+        names_text = "、".join(all_zero)
+        messages.append(f"以下非毕业季助理本月应值与实际均为 0（可能被遗漏排班）：{names_text}")
+
+    return {"messages": messages, "highlight_names": highlight_names}
+
+
+def sort_monthly_rows(rows: list[dict]) -> list[dict]:
+    """按月统计规则排序：多值降序、缺班升序、姓名拼音升序。"""
+    normalized = [_normalize_monthly_row(row) for row in rows]
+    normalized.sort(key=lambda r: (-r["多值班次"], r["缺班数量"], pinyin_key(r["姓名"])))
+    return normalized
+
+
+def generate_monthly_word_from_rows(
+    rows: list[dict],
+    output_path: str,
+    title_text: str | None = None,
+) -> str:
+    """根据已确认/已编辑的月统计行生成 Word。"""
+    rows = sort_monthly_rows(rows)
+    if not rows:
+        raise ValueError("月统计数据为空，无法生成 Word。")
     doc = _build_monthly_document(rows, title_text or "助理值班统计")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -127,6 +234,38 @@ def generate_monthly_word(
             f"无法写入 {output_path}，请先关闭已打开的该 Word 文件后重试。"
         )
     return output_path
+
+
+def _normalize_monthly_row(row: dict) -> dict:
+    name = str(row.get("姓名", "")).strip()
+    if not name:
+        raise ValueError("月统计数据中存在空姓名。")
+
+    total_cnt = _coerce_int(row.get("总计班次", 0), "总计班次")
+    should_cnt = _coerce_int(row.get("应值班次", 0), "应值班次")
+    if "多值班次" in row:
+        over = _coerce_int(row.get("多值班次", 0), "多值班次")
+    else:
+        over = total_cnt - should_cnt
+    if "缺班数量" in row:
+        absence = _coerce_int(row.get("缺班数量", 0), "缺班数量")
+    else:
+        absence = should_cnt - total_cnt
+
+    return {
+        "姓名": name,
+        "总计班次": total_cnt,
+        "应值班次": should_cnt,
+        "多值班次": over,
+        "缺班数量": absence,
+    }
+
+
+def _coerce_int(value, label: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}必须为整数。")
 
 
 # ============================================================
@@ -197,7 +336,7 @@ def _install_numbering_definition(doc):
     _append_leaf(abstract_num, "w:tmpl", {"w:val": "25DA516C"})
 
     level_specs = [
-        ("0", "decimal", "%1", "center", {"w:left": "0", "w:firstLine": "175"}, "7"),
+        ("0", "decimal", "%1", "center", {"w:left": "0", "w:firstLine": "0"}, "7"),
         ("1", "lowerLetter", "%2)", "left", {"w:left": "439", "w:hanging": "420"}, None),
         ("2", "lowerRoman", "%3.", "right", {"w:left": "859", "w:hanging": "420"}, None),
         ("3", "decimal", "%4.", "left", {"w:left": "1279", "w:hanging": "420"}, None),
@@ -217,6 +356,8 @@ def _install_numbering_definition(doc):
             _append_leaf(lvl, "w:pStyle", {"w:val": p_style})
         _append_leaf(lvl, "w:lvlText", {"w:val": lvl_text})
         _append_leaf(lvl, "w:lvlJc", {"w:val": lvl_jc})
+        if ilvl == "0":
+            _append_leaf(lvl, "w:suff", {"w:val": "nothing"})
 
         p_pr = OxmlElement("w:pPr")
         _append_leaf(p_pr, "w:ind", indent_attrs)
@@ -394,8 +535,7 @@ def _set_cell_text(tc_element, text: str, size: str, align: str = "center"):
     _clear_paragraphs(tc_element)
     p = OxmlElement("w:p")
     p_pr = OxmlElement("w:pPr")
-    _append_leaf(p_pr, "w:jc", {"w:val": align})
-    _append_leaf(p_pr, "w:textAlignment", {"w:val": "center"})
+    _append_centered_paragraph_layout(p_pr, align)
     p_r_pr = OxmlElement("w:rPr")
     _append_run_style(p_r_pr, size)
     p_pr.append(p_r_pr)
@@ -421,14 +561,29 @@ def _set_numbered_cell(tc_element):
     _append_leaf(p_r_pr, "w:lang", {"w:bidi": "ar"})
     _append_leaf(p_r_pr, "w:sz", {"w:val": BODY_FONT_SIZE})
     _append_leaf(p_r_pr, "w:szCs", {"w:val": BODY_FONT_SIZE})
-    p_pr.append(p_r_pr)
 
     num_pr = OxmlElement("w:numPr")
     _append_leaf(num_pr, "w:ilvl", {"w:val": "0"})
     _append_leaf(num_pr, "w:numId", {"w:val": "1"})
     p_pr.append(num_pr)
+    _append_centered_paragraph_layout(p_pr, "center")
+    _append_leaf(p_pr, "w:ind", {"w:left": "0", "w:firstLine": "0"})
+    p_pr.append(p_r_pr)
     p.append(p_pr)
     tc_element.append(p)
+
+
+def _append_centered_paragraph_layout(p_pr, align: str):
+    """让单元格内文字在视觉上贴近表格正中。"""
+    _append_leaf(p_pr, "w:snapToGrid", {"w:val": "0"})
+    _append_leaf(p_pr, "w:spacing", {
+        "w:before": "0",
+        "w:after": "0",
+        "w:line": "240",
+        "w:lineRule": "auto",
+    })
+    _append_leaf(p_pr, "w:jc", {"w:val": align})
+    _append_leaf(p_pr, "w:textAlignment", {"w:val": "center"})
 
 
 def _clear_paragraphs(tc_element):

@@ -1,11 +1,18 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest_tmp/
 htmlcov/
 .coverage
 .venv/
 
 data/config.json
 output/
+
+# PyInstaller 生成文件（保留可复现打包所需的 spec 配置）
+dist/
+tonban_exe/
+build/pyinstaller/*
+!build/pyinstaller/TonBanAPP.spec
 
 *.log

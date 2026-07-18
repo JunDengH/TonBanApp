@@ -2,7 +2,6 @@
 """
 Excel生成模块：
 A. 周统计Excel（5列）
-B. 月统计Excel（6列，含斜线样式）
 """
 import os
 import pandas as pd
@@ -10,8 +9,21 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Border, Side, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from src.modules.word_parser import parse_weekly_schedule, count_actual_shifts
-from src.utils.helpers import pinyin_key
+from src.modules.word_parser import (
+    parse_weekly_schedule,
+    count_actual_shifts,
+    find_typo_suspects,
+)
+from src.modules.schedule_parser import parse_schedule_file, scan_schedule_file
+
+
+LONG_TERM_LEAVE_SHOULD = 2
+WEEKLY_SHOULD_MAX = 2
+SUPPORTED_HOLIDAYS = {"周一", "周二", "周三", "周四", "周五"}
+SENIOR_MODE_NORMAL = "normal"
+SENIOR_MODE_REDUCED = "reduced"
+SENIOR_MODE_NONE = "none"
+SENIOR_SHOULD_MODES = {SENIOR_MODE_NORMAL, SENIOR_MODE_REDUCED, SENIOR_MODE_NONE}
 
 
 # ============================================================
@@ -24,7 +36,10 @@ def generate_weekly_excel(
     output_path: str,
     actual_word_path: str | None = None,
     senior_assistants: list | None = None,
-    senior_should_fixed_enabled: bool = False,
+    senior_should_fixed_enabled: bool | str = False,
+    long_term_leave_assistants: list | None = None,
+    final_week_enabled: bool = False,
+    corrections: dict | None = None,
 ) -> str:
     """
     生成周统计Excel。
@@ -35,45 +50,134 @@ def generate_weekly_excel(
         output_path: 输出文件完整路径（.xlsx）
         actual_word_path: 实际周统计人员名单Word路径（用于实际班次计算）；
                  为空时回退使用 word_path（兼容旧流程）
-        senior_assistants: 被标记为大四助理的姓名列表
-        senior_should_fixed_enabled: 开启后，大四助理应值班次强制为 1
+        senior_assistants: 被纳入毕业季特殊逻辑名单的姓名列表
+        senior_should_fixed_enabled: 少值班模式下，毕业季助理应值班次强制为 1
+        long_term_leave_assistants: 被标记为长期请假的助理；其应值班次视作 2，
+                 但仍会被毕业季特殊逻辑覆盖
+        final_week_enabled: 期末周规则。开启后排版表/值班表中每位助理仅出现一次，
+                 但每次出现计为两次值班（应值/实际计数及放假核减均 ×2）；固定额度
+                 （长期请假应值、毕业季模式）不翻倍。
+        corrections: 暂时纠错映射 {"张灏琛": "张颢琛"}，将错字当作正确姓名计数，不修改原文件。
     返回:
         实际写入的文件路径
     """
-    # 1) 解析排班名单：用于应值班次
-    weekly_schedule_for_should = parse_weekly_schedule(word_path, total_names)
+    rows = build_weekly_rows(
+        word_path=word_path,
+        total_names=total_names,
+        holidays=holidays,
+        actual_word_path=actual_word_path,
+        senior_assistants=senior_assistants,
+        senior_should_fixed_enabled=senior_should_fixed_enabled,
+        long_term_leave_assistants=long_term_leave_assistants,
+        final_week_enabled=final_week_enabled,
+        corrections=corrections,
+    )
+    return generate_weekly_excel_from_rows(rows, output_path)
 
-    # 2) 解析实际名单：用于实际班次（兼容旧流程）
+
+def build_weekly_rows(
+    word_path: str,
+    total_names: list,
+    holidays: list,
+    actual_word_path: str | None = None,
+    senior_assistants: list | None = None,
+    senior_should_fixed_enabled: bool | str = False,
+    long_term_leave_assistants: list | None = None,
+    final_week_enabled: bool = False,
+    corrections: dict | None = None,
+) -> list[dict]:
+    """计算周统计预览行，不写入文件。
+
+    corrections: 暂时纠错映射，将排班/实际文件中的错字当作正确姓名计数。
+    """
+    schedule_for_should = parse_schedule_file(word_path, total_names, corrections)
     actual_source_path = actual_word_path or word_path
-    weekly_schedule_for_actual = parse_weekly_schedule(actual_source_path, total_names)
-    actual = count_actual_shifts(weekly_schedule_for_actual, total_names)
+    schedule_for_actual = parse_weekly_schedule(actual_source_path, total_names, corrections)
+    return build_weekly_rows_from_schedules(
+        schedule_for_should=schedule_for_should,
+        schedule_for_actual=schedule_for_actual,
+        total_names=total_names,
+        holidays=holidays,
+        senior_assistants=senior_assistants,
+        senior_should_fixed_enabled=senior_should_fixed_enabled,
+        long_term_leave_assistants=long_term_leave_assistants,
+        final_week_enabled=final_week_enabled,
+    )
 
-    # 3) 应值班次：优先按排班名单统计，再按放假日期核减
-    should = count_actual_shifts(weekly_schedule_for_should, total_names)
+
+def build_weekly_rows_from_schedules(
+    schedule_for_should: dict[str, list[str]],
+    schedule_for_actual: dict[str, list[str]],
+    total_names: list,
+    holidays: list,
+    senior_assistants: list | None = None,
+    senior_should_fixed_enabled: bool | str = False,
+    long_term_leave_assistants: list | None = None,
+    final_week_enabled: bool = False,
+) -> list[dict]:
+    """计算已解析排班与实际名单的周统计行，不读取或写入文件。"""
+    invalid_holidays = [holiday for holiday in (holidays or []) if holiday not in SUPPORTED_HOLIDAYS]
+    if invalid_holidays:
+        raise ValueError("放假日期只支持周一到周五。")
+
+    # 期末周规则：每次出现计为两次值班，应值/实际计数及放假核减均 ×2。
+    multiplier = 2 if final_week_enabled else 1
+
+    # 0) 期末周与毕业季"少值班"冲突校验：期末周实际班次永远是偶数，而少值班应值=1，
+    #    无法对齐，故在生成入口拦截，提示用户改配置。
+    senior_should_mode = _normalize_senior_should_mode(senior_should_fixed_enabled)
+    if (
+        final_week_enabled
+        and senior_should_mode == SENIOR_MODE_REDUCED
+        and any(name in set(senior_assistants or []) for name in total_names)
+    ):
+        raise ValueError(
+            "期末周规则与毕业季『少值班』模式冲突：期末周每次值班按 2 次计，"
+            "『少值班』额度为 1 次无法对齐。请改为『无需值班』或『正常值班』，"
+            "或关闭期末周规则后再生成。"
+        )
+
+    actual = {n: c * multiplier for n, c in count_actual_shifts(schedule_for_actual, total_names).items()}
+
+    # 3) 应值班次：优先按排班名单统计（×multiplier），再按放假日期核减
+    should = {n: c * multiplier for n, c in count_actual_shifts(schedule_for_should, total_names).items()}
     holiday_reduction_counter = {n: 0 for n in total_names}
     for holiday in holidays or []:
-        if holiday not in weekly_schedule_for_should:
+        if holiday not in schedule_for_should:
             continue
         # 统计当日每人排班次数
-        day_names = weekly_schedule_for_should[holiday]
+        day_names = schedule_for_should[holiday]
         per_person = {}
         for n in day_names:
             per_person[n] = per_person.get(n, 0) + 1
-        # 核减
+        # 核减：期末周下每次出现按 2 次核减；holiday_reduction_counter 仍记原始次数，
+        # 仅供毕业季"少值班"分支使用（该分支在期末周下已被步骤 0 拦截）。
         for person, times in per_person.items():
             if person in holiday_reduction_counter:
                 holiday_reduction_counter[person] += times
-            should[person] = max(0, should[person] - times)
+            should[person] = max(0, should[person] - times * multiplier)
 
-    # 4) 可选规则：大四助理应值班次固定为 1
-    if senior_should_fixed_enabled and senior_assistants:
+    # 4) 长期请假规则：只对用户显式选择的助理生效。
+    total_name_set = set(total_names)
+    long_term_leave_names = {
+        name for name in (long_term_leave_assistants or [])
+        if name in total_name_set
+    }
+    for name in long_term_leave_names:
+        should[name] = LONG_TERM_LEAVE_SHOULD
+
+    # 5) 毕业季特殊逻辑：三档模式覆盖默认应值班次，并约束长期请假助理。
+    #    （senior_should_mode 已在步骤 0 计算）
+    if senior_should_mode != SENIOR_MODE_NORMAL and senior_assistants:
         senior_set = set(senior_assistants)
         for name in total_names:
             if name in senior_set:
                 # 放假优先级更高：先固定为1，再按放假核减
-                should[name] = max(0, 1 - holiday_reduction_counter.get(name, 0))
+                if senior_should_mode == SENIOR_MODE_NONE:
+                    should[name] = 0
+                else:
+                    should[name] = max(0, 1 - holiday_reduction_counter.get(name, 0))
 
-    # 5. 构建DataFrame
     rows = []
     for name in total_names:
         s = should[name]
@@ -86,19 +190,188 @@ def generate_weekly_excel(
             "缺班": absence,
             "备注": "",
         })
-    df = pd.DataFrame(rows, columns=["姓名", "应值班次", "实际班次", "缺班", "备注"])
 
-    # 6. 按缺班倒序
+    rows.sort(key=lambda row: -row["缺班"])
+    return rows
+
+
+def _weekly_word_sources(schedule_word_path, actual_word_path) -> list[tuple]:
+    """
+    返回去重后的 (来源标签, 路径) 列表，供周统计扫描复用。
+    - 仅保留存在的路径；
+    - 同一个文件被同时选为排班与实际时只保留排班来源，避免重复扫描 / 重复计数。
+    """
+    sources = []
+    schedule_label = "排班 PDF" if str(schedule_word_path or "").lower().endswith(".pdf") else "排班 Word"
+    for label, path in ((schedule_label, schedule_word_path), ("实际 Word", actual_word_path)):
+        if not path or not os.path.exists(path):
+            continue
+        if any(os.path.samefile(path, kept) for _, kept in sources):
+            continue
+        sources.append((label, path))
+    return sources
+
+
+def collect_weekly_warnings(
+    rows: list[dict],
+    schedule_word_path: str,
+    actual_word_path: str | None,
+    total_names: list,
+    corrections: dict | None = None,
+) -> dict:
+    """
+    周统计生成前的软警告（不阻断生成）。
+
+    corrections: 暂时纠错映射；已纠错的姓名不会出现在 unknown_names / typo_messages 中。
+
+    返回:
+        {
+            "messages": [str, ...],            # 人类可读的提醒，逐条列出
+            "highlight_names": set[str],       # 需要在预览里高亮的姓名（应值班次 > 2）
+            "typo_messages_strong": [str,...], # 疑似打错字（高度疑似 + 疑似），单独弹窗用
+            "typo_messages_weak": [str, ...],  # 形近待确认（读音不同），单独列出
+            "typo_suspects": [dict, ...],      # 结构化明细，含 source / name / candidates / level
+        }
+    """
+    messages = []
+    typo_messages_strong = []
+    typo_messages_weak = []
+    typo_suspects = []
+    highlight_names = {
+        row["姓名"] for row in rows if row.get("应值班次", 0) > WEEKLY_SHOULD_MAX
+    }
+    if highlight_names:
+        names_text = "、".join(sorted(highlight_names))
+        messages.append(f"以下助理本周应值班次大于 {WEEKLY_SHOULD_MAX}：{names_text}")
+
+    for label, path in _weekly_word_sources(schedule_word_path, actual_word_path):
+        scan = scan_schedule_file(path, total_names, corrections)
+        if scan["matched_count"] == 0:
+            messages.append(f"{label} 未识别到任何总名单内姓名，请确认是否选错文件。")
+
+        # 先从未知名里挑出疑似打错字，按档位单独、醒目地提醒；其余未知名仍按“已忽略”提示。
+        suspects = find_typo_suspects(scan["unknown_names"], total_names)
+        suspect_names = set()
+        for suspect in suspects:
+            suspect_names.add(suspect["name"])
+            candidate_text = "、".join(suspect["candidates"])
+            if suspect["level"] == "weak":
+                typo_messages_weak.append(
+                    f"{label} 中『{suspect['name']}』与总名单中『{candidate_text}』"
+                    f"字形相近（读音不同），请确认是否同一人"
+                )
+            else:
+                typo_messages_strong.append(
+                    f"{label} 中『{suspect['name']}』与总名单中『{candidate_text}』"
+                    f"高度相似，疑似打错字"
+                )
+            typo_suspects.append({
+                "source": label,
+                "name": suspect["name"],
+                "candidates": suspect["candidates"],
+                "level": suspect["level"],
+            })
+
+        remaining_unknown = [n for n in scan["unknown_names"] if n not in suspect_names]
+        if remaining_unknown:
+            unknown_text = "、".join(remaining_unknown[:10])
+            if len(remaining_unknown) > 10:
+                unknown_text += "…"
+            messages.append(
+                f"{label} 中以下内容不在总名单（已忽略，也可能是说明文字）：{unknown_text}"
+            )
+
+    return {
+        "messages": messages,
+        "highlight_names": highlight_names,
+        "typo_messages_strong": typo_messages_strong,
+        "typo_messages_weak": typo_messages_weak,
+        "typo_suspects": typo_suspects,
+    }
+
+
+def collect_typo_suspects(
+    schedule_word_path: str | None,
+    actual_word_path: str | None,
+    total_names: list,
+) -> list[dict]:
+    """
+    扫描排班 / 实际 Word，返回疑似打错字明细，供生成前检查面板实时显示。
+
+    与 collect_weekly_warnings 中的 typo 逻辑一致，但不依赖预览行、只做轻量扫描，
+    路径不存在或与排班同一文件时静默跳过。返回:
+        [{"source": str, "name": str, "candidates": [str, ...], "level": str}, ...]
+    """
+    results = []
+    for label, path in _weekly_word_sources(schedule_word_path, actual_word_path):
+        scan = scan_schedule_file(path, total_names)
+        for suspect in find_typo_suspects(scan["unknown_names"], total_names):
+            results.append({
+                "source": label,
+                "name": suspect["name"],
+                "candidates": suspect["candidates"],
+                "level": suspect["level"],
+            })
+    return results
+
+
+def generate_weekly_excel_from_rows(rows: list[dict], output_path: str) -> str:
+    """根据预览确认后的周统计行写入 Excel。"""
+    normalized_rows = [_normalize_weekly_row(row) for row in rows]
+    df = pd.DataFrame(normalized_rows, columns=["姓名", "应值班次", "实际班次", "缺班", "备注"])
     df = df.sort_values(by="缺班", ascending=False, kind="mergesort").reset_index(drop=True)
 
-    # 7. 写入Excel（带样式）
     _safe_write_excel(df, output_path, sheet_name="周统计", apply_weekly_style=True)
     return output_path
+
+
+def _normalize_weekly_row(row: dict) -> dict:
+    name = str(row.get("姓名", "")).strip()
+    if not name:
+        raise ValueError("周统计数据中存在空姓名。")
+    should = _coerce_non_negative_int(row.get("应值班次", 0), name, "应值班次")
+    actual = _coerce_non_negative_int(row.get("实际班次", 0), name, "实际班次")
+    return {
+        "姓名": name,
+        "应值班次": should,
+        "实际班次": actual,
+        "缺班": max(0, should - actual),
+        "备注": str(row.get("备注", "") or "").strip(),
+    }
+
+
+def _coerce_non_negative_int(value, name: str, column: str) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0
+        if text.isdigit():
+            return int(text)
+        raise ValueError(f"{name} 的【{column}】必须为非负整数。")
+    if isinstance(value, bool):
+        raise ValueError(f"{name} 的【{column}】必须为非负整数。")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} 的【{column}】必须为非负整数。")
+    if number < 0 or not number.is_integer():
+        raise ValueError(f"{name} 的【{column}】必须为非负整数。")
+    return int(number)
 
 
 # ============================================================
 # 公共：聚合 4 周 Excel
 # ============================================================
+def _normalize_senior_should_mode(value) -> str:
+    if value in SENIOR_SHOULD_MODES:
+        return value
+    if value is True:
+        return SENIOR_MODE_REDUCED
+    return SENIOR_MODE_NORMAL
+
+
 def aggregate_weekly_files(weekly_excel_paths: list, total_names: list):
     """
     读取多个周统计 Excel，按总名单聚合"实际班次""应值班次"。
@@ -121,61 +394,32 @@ def aggregate_weekly_files(weekly_excel_paths: list, total_names: list):
         for _, row in df.iterrows():
             name = str(row["姓名"]).strip()
             if name in total_actual:
-                total_actual[name] += int(row["实际班次"]) if pd.notna(row["实际班次"]) else 0
-                total_should[name] += int(row["应值班次"]) if pd.notna(row["应值班次"]) else 0
+                total_actual[name] += _read_non_negative_int(row["实际班次"], path, name, "实际班次")
+                total_should[name] += _read_non_negative_int(row["应值班次"], path, name, "应值班次")
 
     return total_actual, total_should
 
 
-# ============================================================
-# 子功能 B：月统计 Excel（保留作为回退入口，需求3 UI 不再暴露）
-# ============================================================
-def generate_monthly_excel(
-    weekly_excel_paths: list,
-    total_names: list,
-    output_path: str,
-) -> str:
-    """
-    基于4个周统计Excel生成月统计。
-    参数:
-        weekly_excel_paths: 4个周Excel的路径列表
-        total_names: 总名单
-        output_path: 输出文件完整路径
-    """
-    total_actual, total_should = aggregate_weekly_files(weekly_excel_paths, total_names)
-
-    # 构建DataFrame
-    rows = []
-    for name in total_names:
-        a = total_actual[name]
-        s = total_should[name]
-        over = a - s          # 多值班次
-        absence = s - a       # 缺班数量
-        rows.append({
-            "姓名": name,
-            "总计班次": a,
-            "应值班次": s,
-            "多值班次": over,
-            "缺班数量": absence,
-        })
-    df = pd.DataFrame(rows)
-
-    # 排序：多值班次降序 -> 缺班数量升序 -> 姓名拼音升序
-    df["_pinyin"] = df["姓名"].apply(pinyin_key)
-    df = df.sort_values(
-        by=["多值班次", "缺班数量", "_pinyin"],
-        ascending=[False, True, True],
-        kind="mergesort",
-    ).drop(columns=["_pinyin"]).reset_index(drop=True)
-
-    # 插入序号列
-    df.insert(0, "序号", range(1, len(df) + 1))
-    df = df[["序号", "姓名", "总计班次", "应值班次", "多值班次", "缺班数量"]]
-
-    # 写入并应用特殊样式（<=0 单元格画斜线）
-    _safe_write_excel(df, output_path, sheet_name="月统计",
-                      apply_monthly_style=True)
-    return output_path
+def _read_non_negative_int(value, path, name: str, column: str) -> int:
+    """Read shift counts from user-editable weekly Excel cells."""
+    if pd.isna(value):
+        return 0
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0
+        if text.isdigit():
+            return int(text)
+        raise ValueError(f"{path} 中 {name} 的【{column}】必须为非负整数。")
+    if isinstance(value, bool):
+        raise ValueError(f"{path} 中 {name} 的【{column}】必须为非负整数。")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{path} 中 {name} 的【{column}】必须为非负整数。")
+    if number < 0 or not number.is_integer():
+        raise ValueError(f"{path} 中 {name} 的【{column}】必须为非负整数。")
+    return int(number)
 
 
 # ============================================================
@@ -183,8 +427,7 @@ def generate_monthly_excel(
 # ============================================================
 def _safe_write_excel(df: pd.DataFrame, output_path: str,
                       sheet_name="Sheet1",
-                      apply_weekly_style=False,
-                      apply_monthly_style=False):
+                      apply_weekly_style=False):
     """写入Excel并捕获文件被占用的情况"""
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     try:
@@ -199,9 +442,6 @@ def _safe_write_excel(df: pd.DataFrame, output_path: str,
     wb = load_workbook(output_path)
     ws = wb[sheet_name]
     _apply_base_style(ws)
-
-    if apply_monthly_style:
-        _apply_monthly_slash(ws, df)
 
     wb.save(output_path)
 
@@ -234,32 +474,3 @@ def _apply_base_style(ws):
             if row == 1:
                 cell.font = Font(bold=True)
                 cell.fill = PatternFill("solid", fgColor="D9E1F2")
-
-
-def _apply_monthly_slash(ws, df: pd.DataFrame):
-    """
-    针对月统计：多值班次(E列) / 缺班数量(F列) <= 0 时：
-    清空数字，并加 左上→右下 斜线。
-    df 顺序：序号,姓名,总计班次,应值班次,多值班次,缺班数量
-    """
-    thin = Side(border_style="thin", color="000000")
-    slash_border = Border(
-        left=thin, right=thin, top=thin, bottom=thin,
-        diagonal=thin, diagonalDown=True,
-    )
-
-    # 多值班次=第5列，缺班数量=第6列（表头占第1行，数据从第2行起）
-    col_over = 5
-    col_absence = 6
-    for i, row_data in df.iterrows():
-        excel_row = i + 2
-        # 多值班次
-        if row_data["多值班次"] <= 0:
-            c = ws.cell(row=excel_row, column=col_over)
-            c.value = None
-            c.border = slash_border
-        # 缺班数量
-        if row_data["缺班数量"] <= 0:
-            c = ws.cell(row=excel_row, column=col_absence)
-            c.value = None
-            c.border = slash_border
